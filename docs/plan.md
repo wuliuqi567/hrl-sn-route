@@ -99,10 +99,11 @@
         │  (SB3 DQN)    │ │  Model    │ │  Engine         │
         │               │ │  (SB3 DQN)│ │                 │
         │ obs: 全网+流   │ │ obs: 域内  │ │ · Topology      │
-        │ act: 域间链路   │ │ act: K路径 │ │ · Bandwidth     │
-        │               │ │ 共享权重   │ │ · Flow lifecycle│
-        └───────────────┘ └───────────┘ │ · Domain        │
-                                        └─────────────────┘
+        │ act: 域间链路   │ │ act: 双模式│ │ · Bandwidth     │
+        │               │ │  K路径选择 │ │ · Flow lifecycle│
+        └───────────────┘ │  或逐跳导航│ │ · Domain        │
+                          │ 共享权重   │ └─────────────────┘
+                          └───────────┘
 ```
 
 ### 2.2 上下层交互时序（单条跨域流）
@@ -156,16 +157,46 @@
 | **动作空间** | `Discrete(22)` — 22 条 inter-orbit ISL 中选一条（`sats_per_orbit`） |
 | **奖励** | 中间: $r_{step} = -\alpha \cdot utilization_{selected} - \beta \cdot delay_{selected}$；终局: $R_{final} = \gamma \cdot \mathbb{1}_{success} - \delta \cdot \frac{total\_delay}{max\_delay}$ |
 
-#### Lower Model
+#### Lower Model（双模式）
+
+下层智能体支持 **两种工作模式**，通过配置切换：
+
+##### 模式 A：K 最短路径选择（k_path）
 
 | 项目 | 规格 |
 |------|------|
-| **算法** | DQN（同上） |
-| **观测空间** | `Box(obs_dim,)` |
+| **算法** | DQN |
+| **观测空间** | `Box(22,)` |
 | **观测组成** | K 条候选路径的特征 `[总延迟, 最小剩余带宽, 跳数, 瓶颈利用率]` = K×4=16 维（K=4）+ 子任务特征 `[bw_demand, delay_budget, entry_pos(2), exit_pos(2)]` = 6 维 ≈ **22 维** |
 | **动作空间** | `Discrete(K)` — K=4 条预计算最短路径中选一条 |
 | **奖励** | $r = \lambda_1 \cdot e^{(bw_{remaining}-bw_{max})} + \lambda_2 \cdot e^{-delay_{path}} - \lambda_3 \cdot \mathbb{1}_{fail}$ |
+| **Episode 长度** | **1 步**（单步决策，无序列性） |
+| **done** | **始终 True**（每次决策即为完整 episode） |
 | **权重共享** | 所有域使用同一个 model，不同域的输入通过观测区分 |
+
+##### 模式 B：逐跳导航（hop_by_hop）
+
+| 项目 | 规格 |
+|------|------|
+| **算法** | DQN |
+| **观测空间** | `Box(23,)` |
+| **观测组成** | 当前卫星位置 `[lon, lat, alt]` (3) + 出口卫星位置 `[lon, lat, alt]` (3) + 到出口距离 (1) + 累计时延 (1) + 步数进度 (1) + 带宽需求 (1) + 剩余时延预算 (1) + 4 邻居特征 `[到出口距离, 链路剩余带宽, 域内标志]` (4×3=12) ≈ **23 维** |
+| **动作空间** | `Discrete(4)` — +Grid 四方向（同轨前/后 + 邻轨左/右） |
+| **奖励** | 每跳: $r_{hop} = -\alpha \cdot delay_{hop} - \beta \cdot \mathbb{1}_{revisit} - \gamma \cdot \mathbb{1}_{invalid}$；到达: $r_{arrive} = +R_{success} \cdot (1 - steps/max\_steps)$ |
+| **Episode 长度** | **多步**（1 ~ max_domain_steps，域内卫星数/4 为上限） |
+| **done** | `terminated`: 到达出口卫星；`truncated`: 超过 max_domain_steps |
+| **权重共享** | 同模式 A |
+
+##### 两种模式的对比
+
+| 维度 | K 路径选择 | 逐跳导航 |
+|------|-----------|----------|
+| 决策粒度 | 粗 — 选完整路径 | 细 — 逐节点选下一跳 |
+| 训练难度 | 低 — 类似 contextual bandit | 高 — 需要序列决策 + 信用分配 |
+| 路径质量 | 受限于预计算 K 条路径 | 可探索任意路径组合 |
+| 带宽感知 | 预计算时可加权，但路径固定 | 每跳实时感知带宽状态 |
+| 训练速度 | 快（单步回合） | 慢（多步回合 + 更大搜索空间） |
+| 适用阶段 | 先跑通全流程 | 性能提升阶段 |
 
 ---
 
@@ -352,19 +383,228 @@ class UpperEnvShell(gym.Env):
     def reset(self, **kw): return np.zeros(77, dtype=np.float32), {}
     def step(self, a): return np.zeros(77, dtype=np.float32), 0, True, False, {}
 
-class LowerEnvShell(gym.Env):
-    """仅用于 SB3 模型初始化的空壳环境"""
+# ── K路径模式 ──
+class LowerKPathEnvShell(gym.Env):
+    """K路径选择模式的空壳环境"""
     def __init__(self, sim):
         super().__init__()
         self.observation_space = spaces.Box(-1, 1, shape=(22,), dtype=np.float32)
         self.action_space = spaces.Discrete(4)  # K=4 条候选路径
     def reset(self, **kw): return np.zeros(22, dtype=np.float32), {}
     def step(self, a): return np.zeros(22, dtype=np.float32), 0, True, False, {}
+
+# ── 逐跳模式 ──
+class LowerHopEnvShell(gym.Env):
+    """逐跳导航模式的空壳环境"""
+    def __init__(self, sim):
+        super().__init__()
+        self.observation_space = spaces.Box(-1, 1, shape=(23,), dtype=np.float32)
+        self.action_space = spaces.Discrete(4)  # +Grid 四方向
+    def reset(self, **kw): return np.zeros(23, dtype=np.float32), {}
+    def step(self, a): return np.zeros(23, dtype=np.float32), 0, False, False, {}
+```
+
+### 3.5 下层智能体训练机制详解
+
+#### 3.5.1 K 路径选择模式的训练
+
+K 路径选择本质上是 **contextual bandit（上下文赌博机）**，不是序列决策：
+
+```
+┌───────────────────────────────────────────────────┐
+│  子任务到达 (entry_sat → exit_sat, bw, delay)      │
+│       ↓                                            │
+│  计算 K=4 条候选路径 (带宽感知权重)                  │
+│       ↓                                            │
+│  构建观测 obs (22 维)                               │
+│       ↓                                            │
+│  lower_model.predict(obs) → action ∈ {0,1,2,3}    │
+│       ↓                                            │
+│  执行 selected_path, 获得 reward                    │
+│       ↓                                            │
+│  存入 replay_buffer:                                │
+│    (obs, next_obs=零向量, action, reward, done=True)│
+│                                                     │
+│  ★ done 始终为 True → DQN 目标退化为:               │
+│    Q(s,a) ← r    (无未来折扣项)                     │
+│    即 γ·max_a' Q(s',a')·(1-done) = 0               │
+│    模型本质上学习 Q(s,a) ≈ E[R(s,a)]               │
+└───────────────────────────────────────────────────┘
+```
+
+**为什么没有 done 概念也能训练？**
+
+因为 DQN 的 TD-target 公式为：
+$$y = r + \gamma \cdot \max_{a'} Q_{target}(s', a') \cdot (1 - done)$$
+
+当 $done = 1$ 时，$y = r$，即 Q 值直接回归到即时奖励。这在 SB3 中完全支持——每次调用 `replay_buffer.add()` 时传入 `done=True`，DQN 就会正确处理单步回合。
+
+**训练效果**：模型学习到的是"在给定网络状态和子任务下，选哪条路径期望奖励最高"，本质是一个条件回归问题。收敛通常比多步 RL 更快更稳定。
+
+#### 3.5.2 逐跳导航模式的训练
+
+逐跳模式是标准的 **多步 MDP**，有明确的 terminated/truncated 概念：
+
+```python
+def route_intra_domain_hop(lower_model, sim, entry_sat, exit_sat, flow, domain_id):
+    """逐跳模式: 下层智能体在域内逐步导航"""
+    domain_sats = set(sim.domain.get_domain_sats(domain_id))
+    max_steps = len(domain_sats) // 4  # 域内卫星数/4 作为步数上限
+    
+    current_sat = entry_sat
+    path = [current_sat]
+    visited = {current_sat}
+    accumulated_delay = 0.0
+    experiences = []
+    
+    for step in range(max_steps):
+        # ── 观测 ──
+        obs = build_hop_observation(
+            sim, current_sat, exit_sat, domain_id, domain_sats,
+            accumulated_delay, step, max_steps, flow)
+        
+        # ── 动作 ──
+        action, _ = lower_model.predict(obs, deterministic=False)
+        neighbors = sim.topology.adj[current_sat]  # [up, down, left, right]
+        next_sat = neighbors[action]
+        
+        # ── 判断动作有效性 ──
+        if next_sat == -1 or next_sat not in domain_sats:
+            # 无效动作: 边界外或不存在
+            reward = -0.5
+            terminated = False
+            truncated = (step == max_steps - 1)
+            next_obs = obs  # 原地不动
+        else:
+            hop_delay = sim.topology.get_link_delay(
+                current_sat, next_sat, sim.current_timeslot)
+            accumulated_delay += hop_delay
+            
+            # 检查该跳链路带宽
+            has_bw = sim.bandwidth.get_remaining_bw(
+                current_sat, next_sat) >= flow.bandwidth
+            
+            current_sat = next_sat
+            path.append(current_sat)
+            
+            # ── 终止条件 ──
+            terminated = (current_sat == exit_sat)
+            truncated = (step == max_steps - 1) and not terminated
+            
+            # ── 奖励 ──
+            reward = -hop_delay / 0.05  # 归一化时延惩罚
+            if current_sat in visited:
+                reward -= 0.3  # 重访惩罚
+            if not has_bw:
+                reward -= 0.5  # 带宽不足惩罚
+            if terminated:
+                reward += 5.0 * (1.0 - step / max_steps)  # 到达奖励
+            if truncated:
+                dist = sim.topology.sat_distance(current_sat, exit_sat)
+                reward -= 2.0 * dist / 20000  # 未到达距离惩罚
+            
+            visited.add(current_sat)
+            next_obs = build_hop_observation(
+                sim, current_sat, exit_sat, domain_id, domain_sats,
+                accumulated_delay, step + 1, max_steps, flow)
+        
+        # ── 收集经验 ──
+        experiences.append((obs, next_obs, action, reward, terminated, truncated))
+        
+        if terminated or truncated:
+            break
+    
+    success = (current_sat == exit_sat)
+    return path if success else None, accumulated_delay, experiences
+```
+
+#### 3.5.3 逐跳模式的域边界处理
+
+逐跳模式的核心难点是 **域边界约束**——智能体不能跳出当前域：
+
+```
+域 d 的卫星集合: domain_sats = {sat_1, sat_2, ..., sat_264}
++Grid 邻居: adj[sat_id] = [up, down, left, right]
+
+对于边界轨道上的卫星:
+  · 域右边界: right 邻居 ∉ domain_sats → 动作 3 (right) 无效
+  · 域左边界: left 邻居 ∉ domain_sats → 动作 2 (left) 无效
+  · 同轨 up/down: 始终域内有效
+
+处理方式: 在观测中通过 "域内标志" 向智能体提供信息
+  neighbor_features[i] = [..., in_domain_flag]
+  in_domain_flag = 1.0 if 邻居 ∈ domain_sats else 0.0
+
+当智能体选择域外方向时:
+  → 原地不动 + 惩罚 reward = -0.5
+  → 不消耗步数 (或消耗, 增加 truncation 压力)
+```
+
+#### 3.5.4 逐跳模式下的带宽分配策略
+
+逐跳导航与带宽分配有时序矛盾：逐跳时路径尚不完整，无法预先检查全路径带宽。
+
+**方案：乐观路由 + 事后验证**
+
+```
+1. 逐跳导航阶段: 智能体在每一跳观测邻居链路的剩余带宽，
+   但 不做带宽预留（仅读取，不修改）
+2. 路径完成后: 整条路径一次性检查+分配带宽
+3. 如果某条链路带宽不足: 路由失败, 给下层负奖励
+
+为什么不边走边预留?
+  · 如果中途失败需要回滚已预留的带宽，增加复杂度
+  · 在同一 timeslot 内多条流并发时可能产生死锁
+  · 乐观路由更简单且与 K 路径模式一致（都是完整路径后分配）
+```
+
+#### 3.5.5 两种模式与上层交互的统一接口
+
+```python
+def route_intra_domain(lower_model, sim, entry_sat, exit_sat, flow, domain_id, mode):
+    """统一接口: 根据模式调用不同的域内路由"""
+    if mode == "k_path":
+        # 计算 K 条带宽感知路径
+        k_paths = sim.compute_k_shortest(domain_id, entry_sat, exit_sat, K=4)
+        if not k_paths:
+            return None, float('inf'), []
+        obs = build_kpath_observation(sim, k_paths, flow)
+        action, _ = lower_model.predict(obs, deterministic=False)
+        path = k_paths[min(action, len(k_paths) - 1)]
+        ok, delay = sim.try_allocate_segment(path, flow.bandwidth)
+        reward = compute_kpath_reward(delay, ok, flow)
+        # 单步经验: done=True
+        exps = [(obs, np.zeros_like(obs), action, reward, True, False)]
+        return path if ok else None, delay, exps
+    
+    elif mode == "hop_by_hop":
+        # 逐跳导航
+        path, delay, exps = route_intra_domain_hop(
+            lower_model, sim, entry_sat, exit_sat, flow, domain_id)
+        if path is not None:
+            ok = sim.bandwidth.allocate(path, flow.bandwidth, flow.flow_id)
+            if not ok:
+                path = None  # 带宽不足
+        return path, delay, exps
 ```
 
 ---
 
 ## 四、域划分 StarPerf 插件设计
+
+### 4.0 星座类型支持策略
+
+| 星座类型 | 代表 | 倾角 | +Grid 特性 | 域环拓扑 | 当前状态 |
+|----------|------|------|-----------|---------|----------|
+| **Walker-Delta** | Starlink (53°), Kuiper (51.9°) | ≤ 80° | 首尾轨道环绕（有 inter-orbit ISL） | **环形**：域 0↔1↔...↔(n-1)↔0 | ✅ 当前实现 |
+| **Walker-Star** | OneWeb (87.9°), Polar (90°) | 80°~100° | 首尾轨道开缝（无 inter-orbit ISL） | **链形**：域 0↔1↔...↔(n-1) | 🔮 未来扩展 |
+
+**当前设计决策**：先仅实现 Walker-Delta（非极轨）类型星座的域划分。代码中保留 `is_polar` 判断分支但以 `NotImplementedError` 拦截，确保未来可无缝扩展到 Walker-Star。
+
+Walker-Delta 环形域拓扑的重要推论：
+- 域级图为 **环形图**，任意两域间最短路径 ≤ `n_domains / 2` 跳
+- 每对相邻域之间有 `sats_per_orbit` 条域间链路（Starlink: 22 条）
+- 域内卫星的 up/down 邻居始终在域内，left/right 邻居在边界处跨域
 
 ### 4.1 插件架构
 
@@ -380,8 +620,8 @@ StarPerf_Simulator/src/XML_constellation/
 └── constellation_domain/                 # 新增
     ├── domain_partition_plugin_manager.py
     └── domain_partition_plugin/
-        ├── by_orbit_plane.py            # 按轨道平面等分
-        └── by_orbit_group.py            # 按轨道组划分（可配置每组轨道数）
+        ├── by_orbit_group.py            # 按轨道组划分（Walker-Delta 适用）
+        └── by_orbit_group_polar.py      # 🔮 未来: Walker-Star 极轨划分
 ```
 
 ### 4.2 插件管理器
@@ -430,13 +670,30 @@ class DomainInfo:
     sats_per_orbit: int
 
 def by_orbit_group(shell, n_domains):
-    """按轨道组等分域"""
+    """按轨道组等分域
+    
+    当前仅支持 Walker-Delta (倾角 ≤ 80°, 非极轨) 星座。
+    轨道环绕: 首尾轨道之间有 inter-orbit ISL, 域形成环形拓扑。
+    
+    Walker-Star (极轨, 80°< inc <100°) 支持预留:
+    - is_polar 分支已保留但当前会 raise NotImplementedError
+    - 未来可实现 by_orbit_group_polar.py 插件单独处理
+    """
     n_orbits = shell.number_of_orbits
     sats_per_orbit = shell.number_of_satellite_per_orbit
+    is_polar = 80 < shell.inclination < 100
+    
+    # ── 当前仅支持 Walker-Delta ──
+    if is_polar:
+        raise NotImplementedError(
+            f"by_orbit_group 当前仅支持 Walker-Delta (inclination ≤ 80°), "
+            f"当前星座倾角 = {shell.inclination}°。"
+            f"Walker-Star 极轨星座请使用 by_orbit_group_polar 插件 (待实现)。"
+        )
+    
     assert n_orbits % n_domains == 0, \
         f"n_orbits({n_orbits}) must be divisible by n_domains({n_domains})"
     orbits_per_domain = n_orbits // n_domains
-    is_polar = 80 < shell.inclination < 100
     
     domain_of_sat = {}
     domain_sats = {d: [] for d in range(n_domains)}
@@ -451,12 +708,10 @@ def by_orbit_group(shell, n_domains):
             domain_sats[domain_id].append(sat_id)
     
     # 识别域间链路: 相邻域边界轨道的 inter-orbit ISL
+    # Walker-Delta: 环形拓扑, 所有相邻域对 (包括 n-1 ↔ 0) 都有域间链路
     inter_domain_links = {}
     for d in range(n_domains):
-        # 右边界
-        d_next = (d + 1) % n_domains
-        if is_polar and d == n_domains - 1:
-            continue  # 极轨最后一域与第一域无连接
+        d_next = (d + 1) % n_domains  # 环形: 最后一域连回第一域
         right_orbit = domain_orbits[d][-1]   # 域 d 最右轨道
         left_orbit = domain_orbits[d_next][0] # 域 d+1 最左轨道
         links = []
@@ -507,7 +762,8 @@ hrl-sn-route/
 │   ├── __init__.py
 │   ├── sim_engine.py            # 网络仿真引擎 (非 Gym, 纯状态机)
 │   ├── upper_env_shell.py       # 上层 SB3 模型初始化用空壳
-│   └── lower_env_shell.py       # 下层 SB3 模型初始化用空壳
+│   ├── lower_kpath_env_shell.py # 下层 K路径模式空壳
+│   └── lower_hop_env_shell.py   # 下层逐跳模式空壳
 ├── agents/                      # RL 智能体封装
 │   ├── __init__.py
 │   └── gnn_extractor.py         # GNN 特征提取器 (DGL + SB3, 可选)
@@ -620,7 +876,10 @@ class FlowManager:
 | 域划分方式 | 按轨道组等分 | 稳定、+Grid 兼容 |
 | 域间路由序列 | 预计算（非 RL 决策） | 组合空间小，非关键决策 |
 | 上层动作 | 选具体域间链路 | 用户要求 |
-| 下层动作 | K=4 最短路径选择 | 参考论文，效率优于逐跳 |
+| 下层动作 | **双模式**：K 路径选择 / 逐跳导航 | K 路径先跑通，逐跳后续提升 |
+| 下层默认模式 | K 路径选择（k_path） | 训练快、调试简单、先验证流程 |
+| 星座类型 | Walker-Delta（非极轨, ≤ 80°） | 当前聚焦 Starlink shell 1 (53°) |
+| Walker-Star 支持 | 代码预留 `is_polar` 分支 | 未来扩展 OneWeb 等极轨星座 |
 | Episode 定义 | 固定时间窗口（100 timeslot） | 捕获流量动态 + 资源竞争 |
 | 训练方式 | 自定义循环 + SB3 低级 API | 兼容分层协调 |
 | GNN | 先 MLP 跑通，后续替换 | 降低调试难度 |
@@ -638,7 +897,7 @@ class FlowManager:
 | P0 | `core/flow.py` + `core/flow_generator.py` | 无 | 小 |
 | P1 | `env/sim_engine.py` | 所有 core 模块 | 大 |
 | P1 | `train/rollout.py` | sim_engine | 大 |
-| P1 | `env/upper_env_shell.py` + `lower_env_shell.py` | sim_engine | 小 |
+| P1 | `env/upper_env_shell.py` + `lower_*_env_shell.py` | sim_engine | 小 |
 | P2 | `train/train_lower.py` | rollout + lower_env | 中 |
 | P2 | `train/train_upper.py` | rollout + upper_env | 中 |
 | P2 | `train/train_hrl.py` | 上面两个 | 中 |
@@ -655,4 +914,7 @@ class FlowManager:
 | K 最短路径计算在大域（264 节点）上可能较慢 | 训练速度 | 缓存已计算路径，仅在带宽状态显著变化时重新计算 |
 | 上层奖励延迟（等所有域段完成）可能影响信用分配 | 上层学习困难 | 使用分步中间奖励 + GAE(λ) 或 n-step return |
 | 下层预训练与实际跨域子任务分布不匹配 | 下层泛化差 | 预训练时使用多样化的 (entry, exit) 对，覆盖域内各种路由场景 |
-| 极轨星座首尾域间无连接，导致某些域对不可达 | 路由失败 | 域级图连通性检查 + 不可达流直接标记失败 |
+| 极轨星座首尾域间无连接，导致某些域对不可达 | 路由失败 | 域级图连通性检查 + 不可达流直接标记失败（当前版本不涉及） |
+| 逐跳模式域边界约束导致动作空间受限 | 边界卫星学习效率低 | 通过观测中的 in_domain_flag 提供先验，让智能体学会避开 |
+| 逐跳模式乐观路由事后验证可能浪费算力 | 路由失败率高 | 逐跳观测中加入每跳剩余带宽信息，引导智能体选宽裕链路 |
+| K 路径与逐跳两种模式训练曲线不可比 | 对比困难 | 使用相同流量负载、统一评估指标（成功率 + 端到端延迟） |

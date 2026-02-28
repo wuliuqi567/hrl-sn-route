@@ -35,6 +35,7 @@ from core.flow import FlowRequest
 from env.sim_engine import NetworkSimEngine
 from env.lower_kpath_env_shell import LowerKPathEnvShell
 from env.lower_hop_env_shell import LowerHopEnvShell
+from agents.model_factory import create_factory_from_config
 from train.rollout import (
     route_intra_kpath, route_intra_hop,
     Experience,
@@ -217,7 +218,8 @@ def train_lower(cfg: dict):
     SB3 DQN model
         训练好的下层模型（同时保存到磁盘）。
     """
-    from stable_baselines3 import DQN
+    # ── 创建模型工厂 (算法由配置决定) ──
+    factory = create_factory_from_config(cfg)
 
     seed = cfg["training"]["seed"]
     rng = np.random.default_rng(seed)
@@ -251,21 +253,9 @@ def train_lower(cfg: dict):
         lower_env = LowerHopEnvShell(sim)
 
     # ── 创建 DQN 模型 ──
-    # TODO: 后续将通过工厂模式重构，支持 DDQN/QRDQN 等算法切换
-    lower_model = DQN(
-        "MlpPolicy",           # 多层感知机策略网络
-        lower_env,                # 提供 obs/act 空间定义的 Shell 环境
-        learning_rate=dqn_cfg["learning_rate"],          # 学习率
-        buffer_size=dqn_cfg["buffer_size"],              # 回放缓冲区大小
-        batch_size=dqn_cfg["batch_size"],                # 每次梯度更新的批量大小
-        gamma=dqn_cfg["gamma"],                          # 折扣因子
-        tau=dqn_cfg["tau"],                              # 目标网络软更新系数
-        target_update_interval=dqn_cfg["target_update_interval"],  # 目标网络更新间隔
-        exploration_fraction=dqn_cfg["exploration_fraction"],      # 探索率衰减比例
-        exploration_final_eps=dqn_cfg["exploration_final_eps"],    # 最终探索率
-        learning_starts=dqn_cfg["batch_size"],  # 累积到 1 个 batch 后开始训练
-        verbose=0,                              # 不打印 SB3 内部日志
-        seed=seed,                              # 随机种子 (可复现性)
+    # 工厂根据 cfg["training"]["algorithm"] 自动选择算法 (DQN/QRDQN/...)
+    lower_model = factory.create_model(
+        lower_env, dqn_cfg, seed=seed,
     )
 
     n_episodes = cfg["training"]["pretrain_episodes"]
@@ -301,27 +291,20 @@ def train_lower(cfg: dict):
                 lower_model, sim, n_subtasks, rng)
 
         # ── 手动插入 SB3 回放缓冲区 ──
-        # 注意: 这是 SB3 off-policy 算法的通用 API，
-        # DQN/DDQN/QRDQN 都使用相同的 replay_buffer.add() 接口。
-        # 但 on-policy 算法 (PPO/A2C) 无此接口，需要不同的训练循环。
+        # 工厂封装了 off-policy 算法通用的 replay_buffer.add() 调用，
+        # 使训练脚本无需关心底层算法差异。
         n_added = 0
         for exp in exps:
-            obs = exp.obs.reshape(1, -1)
-            next_obs = exp.next_obs.reshape(1, -1)
-            action = np.array([[exp.action]])
-            reward = np.array([exp.reward])
-            done = np.array([exp.done or exp.truncated])
-            infos = [{}]
-            lower_model.replay_buffer.add(obs, next_obs, action, reward, done, infos)
+            factory.add_experience(lower_model, exp)
             n_added += 1
         total_exps += n_added
 
         # ── 梯度更新 ──
         # 当累积样本数 >= batch_size 时，从 replay buffer 采样进行训练。
         # gradient_steps 正比于本回合新增经验数，避免过度/不足训练。
-        if total_exps >= lower_model.batch_size:
+        if factory.should_train(lower_model, total_exps):
             grad_steps = max(1, n_added // 4)
-            lower_model.train(gradient_steps=grad_steps)
+            factory.train_step(lower_model, gradient_steps=grad_steps)
 
         # Logging
         n_success = sum(1 for e in exps if e.info.get("segment_ok", False))
@@ -338,7 +321,7 @@ def train_lower(cfg: dict):
     save_dir = Path("checkpoints")
     save_dir.mkdir(exist_ok=True)
     save_path = save_dir / f"lower_{lower_mode}_pretrained"
-    lower_model.save(str(save_path))
+    factory.save_model(lower_model, str(save_path))
     logger.close()
     print(f"\n  ✓ Lower model saved to {save_path}")
     print(f"  Total experiences: {total_exps}")

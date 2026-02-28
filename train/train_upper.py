@@ -39,6 +39,7 @@ from env.sim_engine import NetworkSimEngine
 from env.upper_env_shell import UpperEnvShell
 from env.lower_kpath_env_shell import LowerKPathEnvShell
 from env.lower_hop_env_shell import LowerHopEnvShell
+from agents.model_factory import create_factory_from_config
 from train.rollout import run_episode
 from train.logger import TrainingLogger
 
@@ -67,7 +68,8 @@ def train_upper(cfg: dict, lower_ckpt: str):
     SB3 DQN model
         训练好的上层模型。
     """
-    from stable_baselines3 import DQN
+    # ── 创建模型工厂 ──
+    factory = create_factory_from_config(cfg)
 
     seed = cfg["training"]["seed"]
     lower_mode = cfg["routing"]["lower_mode"]
@@ -98,27 +100,14 @@ def train_upper(cfg: dict, lower_ckpt: str):
     else:
         lower_env = LowerHopEnvShell(sim)
 
-    lower_model = DQN.load(lower_ckpt, env=lower_env)  # 加载 Phase 1 检查点
-    lower_model.policy.set_training_mode(False)          # 冻结 BatchNorm/Dropout
-    print(f"  Lower model loaded from {lower_ckpt} (frozen)")
+    lower_model = factory.load_model(lower_ckpt, env=lower_env)
+    factory.set_training_mode(lower_model, False)  # 冻结
+    print(f"  Lower model frozen")
 
-    # ── 创建新的上层 DQN 模型 ──
-    # TODO: 后续将通过工厂模式支持算法切换
+    # ── 创建新的上层模型 ──
     upper_env = UpperEnvShell(sim)
-    upper_model = DQN(
-        "MlpPolicy",
-        upper_env,
-        learning_rate=dqn_cfg["learning_rate"],
-        buffer_size=dqn_cfg["buffer_size"],
-        batch_size=dqn_cfg["batch_size"],
-        gamma=dqn_cfg["gamma"],
-        tau=dqn_cfg["tau"],
-        target_update_interval=dqn_cfg["target_update_interval"],
-        exploration_fraction=dqn_cfg["exploration_fraction"],
-        exploration_final_eps=dqn_cfg["exploration_final_eps"],
-        learning_starts=dqn_cfg["batch_size"],
-        verbose=0,
-        seed=seed,
+    upper_model = factory.create_model(
+        upper_env, dqn_cfg, seed=seed,
     )
 
     n_episodes = cfg["training"]["upper_train_episodes"]
@@ -149,20 +138,13 @@ def train_upper(cfg: dict, lower_ckpt: str):
         # ── 仅将上层经验插入上层回放缓冲区 ──
         # 下层经验 (_) 被丢弃，因为下层已冻结
         for exp in upper_exps:
-            obs = exp.obs.reshape(1, -1)
-            next_obs = exp.next_obs.reshape(1, -1)
-            action = np.array([[exp.action]])
-            reward = np.array([exp.reward])
-            done = np.array([exp.done or exp.truncated])
-            infos = [{}]
-            upper_model.replay_buffer.add(
-                obs, next_obs, action, reward, done, infos)
+            factory.add_experience(upper_model, exp)
         total_upper_exps += len(upper_exps)
 
-        # Train upper
-        if total_upper_exps >= upper_model.batch_size and upper_exps:
+        # ── 训练上层模型 ──
+        if factory.should_train(upper_model, total_upper_exps) and upper_exps:
             grad_steps = max(1, len(upper_exps) // 4)
-            upper_model.train(gradient_steps=grad_steps)
+            factory.train_step(upper_model, gradient_steps=grad_steps)
 
         # Logging
         avg_delay = (np.mean(ep_metrics.delays)
@@ -179,7 +161,7 @@ def train_upper(cfg: dict, lower_ckpt: str):
     save_dir = Path("checkpoints")
     save_dir.mkdir(exist_ok=True)
     save_path = save_dir / "upper_trained"
-    upper_model.save(str(save_path))
+    factory.save_model(upper_model, str(save_path))
     logger.close()
     print(f"\n  ✓ Upper model saved to {save_path}")
     print(f"  Total upper experiences: {total_upper_exps}")

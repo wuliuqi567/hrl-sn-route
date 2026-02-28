@@ -35,6 +35,7 @@ from env.sim_engine import NetworkSimEngine
 from env.upper_env_shell import UpperEnvShell
 from env.lower_kpath_env_shell import LowerKPathEnvShell
 from env.lower_hop_env_shell import LowerHopEnvShell
+from agents.model_factory import create_factory_from_config
 from train.rollout import run_episode, EpisodeMetrics
 from eval.baselines import run_baseline_episode
 
@@ -195,7 +196,7 @@ def main():
 
     # ── HRL evaluation ──
     if not args.baselines_only and args.upper_ckpt and args.lower_ckpt:
-        from stable_baselines3 import DQN
+        factory = create_factory_from_config(cfg)
 
         lower_mode = cfg["routing"]["lower_mode"]
         K = cfg["routing"]["K"]
@@ -206,8 +207,8 @@ def main():
         else:
             lower_env = LowerHopEnvShell(sim)
 
-        upper_model = DQN.load(args.upper_ckpt, env=upper_env)
-        lower_model = DQN.load(args.lower_ckpt, env=lower_env)
+        upper_model = factory.load_model(args.upper_ckpt, env=upper_env)
+        lower_model = factory.load_model(args.lower_ckpt, env=lower_env)
 
         print(f"\n  Evaluating HRL ({lower_mode}) ...")
         hrl_result = evaluate_hrl(sim, upper_model, lower_model, cfg, n_episodes)

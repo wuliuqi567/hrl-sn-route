@@ -39,6 +39,7 @@ from env.sim_engine import NetworkSimEngine
 from env.upper_env_shell import UpperEnvShell
 from env.lower_kpath_env_shell import LowerKPathEnvShell
 from env.lower_hop_env_shell import LowerHopEnvShell
+from agents.model_factory import create_factory_from_config
 from train.rollout import run_episode
 from train.logger import TrainingLogger
 
@@ -119,7 +120,8 @@ def finetune_hrl(
     tuple[SB3 model, SB3 model]
         (微调后的上层模型, 微调后的下层模型)。
     """
-    from stable_baselines3 import DQN
+    # ── 创建模型工厂 ──
+    factory = create_factory_from_config(cfg)
 
     seed = cfg["training"]["seed"]
     lower_mode = cfg["routing"]["lower_mode"]
@@ -141,45 +143,19 @@ def finetune_hrl(
 
     if upper_model is None:
         if upper_ckpt:
-            upper_model = DQN.load(upper_ckpt, env=upper_env)
-            print(f"  Upper model loaded from {upper_ckpt}")
+            upper_model = factory.load_model(upper_ckpt, env=upper_env)
         else:
-            upper_model = DQN(
-                "MlpPolicy", upper_env,
-                learning_rate=dqn_cfg["learning_rate"],
-                buffer_size=dqn_cfg["buffer_size"],
-                batch_size=dqn_cfg["batch_size"],
-                gamma=dqn_cfg["gamma"],
-                tau=dqn_cfg["tau"],
-                target_update_interval=dqn_cfg["target_update_interval"],
-                exploration_fraction=dqn_cfg["exploration_fraction"],
-                exploration_final_eps=dqn_cfg["exploration_final_eps"],
-                learning_starts=dqn_cfg["batch_size"],
-                verbose=0, seed=seed,
-            )
+            upper_model = factory.create_model(upper_env, dqn_cfg, seed=seed)
 
     if lower_model is None:
         if lower_ckpt:
-            lower_model = DQN.load(lower_ckpt, env=lower_env)
-            print(f"  Lower model loaded from {lower_ckpt}")
+            lower_model = factory.load_model(lower_ckpt, env=lower_env)
         else:
-            lower_model = DQN(
-                "MlpPolicy", lower_env,
-                learning_rate=dqn_cfg["learning_rate"],
-                buffer_size=dqn_cfg["buffer_size"],
-                batch_size=dqn_cfg["batch_size"],
-                gamma=dqn_cfg["gamma"],
-                tau=dqn_cfg["tau"],
-                target_update_interval=dqn_cfg["target_update_interval"],
-                exploration_fraction=dqn_cfg["exploration_fraction"],
-                exploration_final_eps=dqn_cfg["exploration_final_eps"],
-                learning_starts=dqn_cfg["batch_size"],
-                verbose=0, seed=seed,
-            )
+            lower_model = factory.create_model(lower_env, dqn_cfg, seed=seed)
 
     # ── 确保双方都在训练模式 (区别于 Phase 2 的冻结) ──
-    upper_model.policy.set_training_mode(True)
-    lower_model.policy.set_training_mode(True)
+    factory.set_training_mode(upper_model, True)
+    factory.set_training_mode(lower_model, True)
 
     n_episodes = cfg["training"]["finetune_episodes"]
 
@@ -210,32 +186,18 @@ def finetune_hrl(
         # 上下层模型各自维护独立的 replay buffer，
         # 因为 obs/action 空间不同，不能混用。
         for exp in upper_exps:
-            upper_model.replay_buffer.add(
-                exp.obs.reshape(1, -1),
-                exp.next_obs.reshape(1, -1),
-                np.array([[exp.action]]),
-                np.array([exp.reward]),
-                np.array([exp.done or exp.truncated]),
-                [{}],
-            )
+            factory.add_experience(upper_model, exp)
         for exp in lower_exps:
-            lower_model.replay_buffer.add(
-                exp.obs.reshape(1, -1),
-                exp.next_obs.reshape(1, -1),
-                np.array([[exp.action]]),
-                np.array([exp.reward]),
-                np.array([exp.done or exp.truncated]),
-                [{}],
-            )
+            factory.add_experience(lower_model, exp)
         total_upper += len(upper_exps)
         total_lower += len(lower_exps)
 
         # ── 分别训练两个模型 ──
         # 上下层独立梯度更新，互不干扰
-        if total_upper >= upper_model.batch_size and upper_exps:
-            upper_model.train(gradient_steps=max(1, len(upper_exps) // 4))
-        if total_lower >= lower_model.batch_size and lower_exps:
-            lower_model.train(gradient_steps=max(1, len(lower_exps) // 4))
+        if factory.should_train(upper_model, total_upper) and upper_exps:
+            factory.train_step(upper_model, gradient_steps=max(1, len(upper_exps) // 4))
+        if factory.should_train(lower_model, total_lower) and lower_exps:
+            factory.train_step(lower_model, gradient_steps=max(1, len(lower_exps) // 4))
 
         # Logging
         avg_delay = (np.mean(ep_metrics.delays)
@@ -257,8 +219,8 @@ def finetune_hrl(
 
     upper_path = save_dir / "upper_finetuned"
     lower_path = save_dir / f"lower_{lower_mode}_finetuned"
-    upper_model.save(str(upper_path))
-    lower_model.save(str(lower_path))
+    factory.save_model(upper_model, str(upper_path))
+    factory.save_model(lower_model, str(lower_path))
 
     print(f"\n  ✓ Upper model saved to {upper_path}")
     print(f"  ✓ Lower model saved to {lower_path}")
@@ -286,7 +248,6 @@ def full_pipeline(cfg: dict):
     cfg : dict
         完整配置字典。
     """
-    from stable_baselines3 import DQN
     from train.train_lower import (
         pretrain_lower_episode_kpath,
         pretrain_lower_episode_hop,
@@ -295,6 +256,9 @@ def full_pipeline(cfg: dict):
     print("\n" + "=" * 60)
     print("  HRL Satellite Routing — Full Training Pipeline")
     print("=" * 60)
+
+    # ── 创建模型工厂 ──
+    factory = create_factory_from_config(cfg)
 
     seed = cfg["training"]["seed"]
     rng = np.random.default_rng(seed)
@@ -315,19 +279,7 @@ def full_pipeline(cfg: dict):
     else:
         lower_env = LowerHopEnvShell(sim)
 
-    lower_model = DQN(
-        "MlpPolicy", lower_env,
-        learning_rate=dqn_cfg["learning_rate"],
-        buffer_size=dqn_cfg["buffer_size"],
-        batch_size=dqn_cfg["batch_size"],
-        gamma=dqn_cfg["gamma"],
-        tau=dqn_cfg["tau"],
-        target_update_interval=dqn_cfg["target_update_interval"],
-        exploration_fraction=dqn_cfg["exploration_fraction"],
-        exploration_final_eps=dqn_cfg["exploration_final_eps"],
-        learning_starts=dqn_cfg["batch_size"],
-        verbose=0, seed=seed,
-    )
+    lower_model = factory.create_model(lower_env, dqn_cfg, seed=seed)
 
     n_pretrain = cfg["training"]["pretrain_episodes"]
     n_subtasks = cfg["training"]["pretrain_subtasks_per_episode"]
@@ -350,15 +302,11 @@ def full_pipeline(cfg: dict):
             exps = pretrain_lower_episode_hop(lower_model, sim, n_subtasks, rng)
 
         for exp in exps:
-            lower_model.replay_buffer.add(
-                exp.obs.reshape(1, -1), exp.next_obs.reshape(1, -1),
-                np.array([[exp.action]]), np.array([exp.reward]),
-                np.array([exp.done or exp.truncated]), [{}],
-            )
+            factory.add_experience(lower_model, exp)
         total_lower_exps += len(exps)
 
-        if total_lower_exps >= lower_model.batch_size and exps:
-            lower_model.train(gradient_steps=max(1, len(exps) // 4))
+        if factory.should_train(lower_model, total_lower_exps) and exps:
+            factory.train_step(lower_model, gradient_steps=max(1, len(exps) // 4))
 
         if (ep + 1) % max(1, n_pretrain // 20) == 0 or ep == 0:
             print(f"  [P1 Ep {ep+1:4d}/{n_pretrain}] "
@@ -366,27 +314,15 @@ def full_pipeline(cfg: dict):
 
     save_dir = Path("checkpoints")
     save_dir.mkdir(exist_ok=True)
-    lower_model.save(str(save_dir / f"lower_{lower_mode}_pretrained"))
+    factory.save_model(lower_model, str(save_dir / f"lower_{lower_mode}_pretrained"))
     print(f"  ✓ Phase 1 complete ({time.time()-t0:.0f}s)")
 
     # ── Phase 2: Upper training (lower frozen) ──
     from env.upper_env_shell import UpperEnvShell
 
-    lower_model.policy.set_training_mode(False)
+    factory.set_training_mode(lower_model, False)
     upper_env = UpperEnvShell(sim)
-    upper_model = DQN(
-        "MlpPolicy", upper_env,
-        learning_rate=dqn_cfg["learning_rate"],
-        buffer_size=dqn_cfg["buffer_size"],
-        batch_size=dqn_cfg["batch_size"],
-        gamma=dqn_cfg["gamma"],
-        tau=dqn_cfg["tau"],
-        target_update_interval=dqn_cfg["target_update_interval"],
-        exploration_fraction=dqn_cfg["exploration_fraction"],
-        exploration_final_eps=dqn_cfg["exploration_final_eps"],
-        learning_starts=dqn_cfg["batch_size"],
-        verbose=0, seed=seed,
-    )
+    upper_model = factory.create_model(upper_env, dqn_cfg, seed=seed)
 
     n_upper_ep = cfg["training"]["upper_train_episodes"]
     print(f"\n{'='*60}")
@@ -403,15 +339,11 @@ def full_pipeline(cfg: dict):
             K=K, deterministic=False,
         )
         for exp in upper_exps:
-            upper_model.replay_buffer.add(
-                exp.obs.reshape(1, -1), exp.next_obs.reshape(1, -1),
-                np.array([[exp.action]]), np.array([exp.reward]),
-                np.array([exp.done or exp.truncated]), [{}],
-            )
+            factory.add_experience(upper_model, exp)
         total_upper_exps += len(upper_exps)
 
-        if total_upper_exps >= upper_model.batch_size and upper_exps:
-            upper_model.train(gradient_steps=max(1, len(upper_exps) // 4))
+        if factory.should_train(upper_model, total_upper_exps) and upper_exps:
+            factory.train_step(upper_model, gradient_steps=max(1, len(upper_exps) // 4))
 
         if (ep + 1) % max(1, n_upper_ep // 20) == 0 or ep == 0:
             sr = ep_metrics.success_rate
@@ -419,12 +351,12 @@ def full_pipeline(cfg: dict):
                   f"upper={len(upper_exps):3d}  SR={sr:.2%}  "
                   f"time={time.time()-t1:.0f}s")
 
-    upper_model.save(str(save_dir / "upper_trained"))
+    factory.save_model(upper_model, str(save_dir / "upper_trained"))
     print(f"  ✓ Phase 2 complete ({time.time()-t1:.0f}s)")
 
     # ── Phase 3: Joint fine-tuning ──
-    upper_model.policy.set_training_mode(True)
-    lower_model.policy.set_training_mode(True)
+    factory.set_training_mode(upper_model, True)
+    factory.set_training_mode(lower_model, True)
 
     finetune_hrl(
         cfg, sim=sim,

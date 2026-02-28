@@ -42,6 +42,13 @@ training:
   seed: 42                   # 随机种子 (可复现性)
   T_episode: 100             # 每回合时隙数
 
+  # RL 算法选择 (通过 agents/model_factory.py 工厂模式创建)
+  # 支持: "DQN" (默认, 内含 Double-Q), "QRDQN" (需安装 sb3-contrib)
+  algorithm: "DQN"
+  # 算法特有额外参数 (覆盖 dqn 段中的同名参数)
+  # 例如 QRDQN: algorithm_kwargs: { n_quantiles: 200 }
+  algorithm_kwargs: {}
+
   # Phase 1: 下层预训练 (随机域内子任务)
   pretrain_episodes: 200     # 预训练回合数
   pretrain_subtasks_per_episode: 50  # 每回合生成的子任务数

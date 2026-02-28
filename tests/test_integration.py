@@ -18,27 +18,79 @@ import sys
 import time
 
 import numpy as np
+import pytest
 
 
-def test_core_modules():
-    """Test core/ modules independently."""
-    print("=" * 60)
-    print("  [1/4] Testing core modules")
-    print("=" * 60)
+# ── Pytest Fixtures ──
+# 这些 fixture 使得各测试函数可通过依赖注入获取共享对象，
+# 不再需要手动传递返回值。
 
+@pytest.fixture(scope="module")
+def sim():
+    """构建共享的 SimEngine（整个测试模块只初始化一次）。"""
     from env.sim_engine import NetworkSimEngine
-
-    t0 = time.time()
-    sim = NetworkSimEngine(
+    return NetworkSimEngine(
         constellation_name="Kuiper",
         shell_idx=0,
         dT=120,
-        n_domains=2,          # 34 orbits / 2 = 17 orbits per domain
+        n_domains=2,
         link_capacity_mbps=2000.0,
         arrival_rate=3.0,
         seed=42,
     )
-    print(f"  SimEngine init: {time.time() - t0:.1f}s")
+
+
+@pytest.fixture(scope="module")
+def factory():
+    """构建 ModelFactory。"""
+    from agents.model_factory import ModelFactory
+    return ModelFactory(algorithm="DQN")
+
+
+@pytest.fixture(scope="module")
+def upper_model(sim, factory):
+    """通过工厂创建上层模型。"""
+    from env.upper_env_shell import UpperEnvShell
+    upper_env = UpperEnvShell(sim)
+    dqn_cfg = {
+        "learning_rate": 1e-4,
+        "buffer_size": 10000,
+        "batch_size": 32,
+    }
+    return factory.create_model(upper_env, dqn_cfg, seed=42)
+
+
+@pytest.fixture(scope="module")
+def lower_model(sim, factory):
+    """通过工厂创建下层模型。"""
+    from env.lower_kpath_env_shell import LowerKPathEnvShell
+    lower_kpath_env = LowerKPathEnvShell(sim, K=4)
+    dqn_cfg = {
+        "learning_rate": 1e-4,
+        "buffer_size": 10000,
+        "batch_size": 32,
+    }
+    return factory.create_model(lower_kpath_env, dqn_cfg, seed=42)
+
+
+@pytest.fixture(scope="module")
+def episode_results(sim, upper_model, lower_model):
+    """运行一个短回合，返回 (upper_exps, lower_exps, metrics)。"""
+    from train.rollout import run_episode
+    return run_episode(
+        upper_model, lower_model, sim,
+        T_episode=5,
+        lower_mode="k_path",
+        K=4,
+        deterministic=False,
+    )
+
+
+def test_core_modules(sim):
+    """Test core/ modules independently."""
+    print("=" * 60)
+    print("  [1/4] Testing core modules")
+    print("=" * 60)
 
     # Basic domain checks
     assert sim.n_domains == 2
@@ -72,16 +124,14 @@ def test_core_modules():
     assert len(paths) > 0, "Should find at least 1 path in domain"
 
     print("  ✓ Core modules OK\n")
-    return sim
 
 
-def test_env_shells(sim):
-    """Test SB3 model initialisation via env shells."""
+def test_env_shells(sim, factory):
+    """Test model initialisation via factory + env shells."""
     print("=" * 60)
-    print("  [2/4] Testing env shells + SB3 model init")
+    print("  [2/4] Testing env shells + factory model init")
     print("=" * 60)
 
-    from stable_baselines3 import DQN
     from env.upper_env_shell import UpperEnvShell
     from env.lower_kpath_env_shell import LowerKPathEnvShell
     from env.lower_hop_env_shell import LowerHopEnvShell
@@ -97,24 +147,16 @@ def test_env_shells(sim):
     print(f"  Lower hop: obs={lower_hop_env.observation_space.shape}, "
           f"act={lower_hop_env.action_space.n}")
 
+    dqn_cfg = {
+        "learning_rate": 1e-4,
+        "buffer_size": 10000,
+        "batch_size": 32,
+    }
+
     t0 = time.time()
-    upper_model = DQN(
-        "MlpPolicy", upper_env,
-        learning_rate=1e-4,
-        buffer_size=10000,
-        batch_size=32,
-        learning_starts=50,
-        verbose=0,
-    )
-    lower_model = DQN(
-        "MlpPolicy", lower_kpath_env,
-        learning_rate=1e-4,
-        buffer_size=10000,
-        batch_size=32,
-        learning_starts=50,
-        verbose=0,
-    )
-    print(f"  SB3 DQN models created in {time.time() - t0:.1f}s")
+    upper_model = factory.create_model(upper_env, dqn_cfg, seed=42)
+    lower_model = factory.create_model(lower_kpath_env, dqn_cfg, seed=42)
+    print(f"  Factory models created in {time.time() - t0:.1f}s")
 
     # Smoke-test predict
     obs = np.zeros(upper_env.observation_space.shape, dtype=np.float32)
@@ -125,29 +167,17 @@ def test_env_shells(sim):
     action, _ = lower_model.predict(obs, deterministic=True)
     print(f"  Lower predict test: action={action}")
 
-    print("  ✓ Env shells + SB3 OK\n")
-    return upper_model, lower_model
+    print("  ✓ Env shells + factory OK\n")
 
 
-def test_rollout(sim, upper_model, lower_model):
+def test_rollout(sim, upper_model, lower_model, episode_results):
     """Test a short episode rollout."""
     print("=" * 60)
     print("  [3/4] Testing rollout (5 timeslots)")
     print("=" * 60)
 
-    from train.rollout import run_episode
+    upper_exps, lower_exps, metrics = episode_results
 
-    t0 = time.time()
-    upper_exps, lower_exps, metrics = run_episode(
-        upper_model, lower_model, sim,
-        T_episode=5,
-        lower_mode="k_path",
-        K=4,
-        deterministic=False,
-    )
-    elapsed = time.time() - t0
-
-    print(f"  Episode done in {elapsed:.1f}s")
     print(f"  Upper experiences: {len(upper_exps)}")
     print(f"  Lower experiences: {len(lower_exps)}")
     print(f"  Flows routed: success={metrics.success_count}, fail={metrics.fail_count}")
@@ -164,37 +194,24 @@ def test_rollout(sim, upper_model, lower_model):
               f"action={e.action}, reward={e.reward:.3f}, done={e.done}")
 
     print("  ✓ Rollout OK\n")
-    return upper_exps, lower_exps
 
 
-def test_replay_buffer(upper_model, lower_model, upper_exps, lower_exps):
-    """Test manual insertion into SB3 replay buffers."""
+def test_replay_buffer(factory, upper_model, lower_model, episode_results):
+    """Test factory-based replay buffer insertion + training."""
     print("=" * 60)
     print("  [4/4] Testing replay buffer insertion + training")
     print("=" * 60)
 
-    import torch as th
+    upper_exps, lower_exps, _ = episode_results
 
     n_upper = 0
     for exp in upper_exps:
-        obs = exp.obs.reshape(1, -1)
-        next_obs = exp.next_obs.reshape(1, -1)
-        action = np.array([[exp.action]])
-        reward = np.array([exp.reward])
-        done = np.array([exp.done or exp.truncated])
-        infos = [{}]
-        upper_model.replay_buffer.add(obs, next_obs, action, reward, done, infos)
+        factory.add_experience(upper_model, exp)
         n_upper += 1
 
     n_lower = 0
     for exp in lower_exps:
-        obs = exp.obs.reshape(1, -1)
-        next_obs = exp.next_obs.reshape(1, -1)
-        action = np.array([[exp.action]])
-        reward = np.array([exp.reward])
-        done = np.array([exp.done or exp.truncated])
-        infos = [{}]
-        lower_model.replay_buffer.add(obs, next_obs, action, reward, done, infos)
+        factory.add_experience(lower_model, exp)
         n_lower += 1
 
     print(f"  Inserted {n_upper} upper, {n_lower} lower experiences")
@@ -202,33 +219,56 @@ def test_replay_buffer(upper_model, lower_model, upper_exps, lower_exps):
     print(f"  Lower buffer pos: {lower_model.replay_buffer.pos}")
 
     # Try training if enough samples
-    min_samples = max(upper_model.batch_size, lower_model.batch_size)
-    if n_upper >= min_samples:
-        upper_model.train(gradient_steps=2)
+    if factory.should_train(upper_model, n_upper):
+        factory.train_step(upper_model, gradient_steps=2)
         print(f"  Upper model trained (2 gradient steps)")
     else:
-        print(f"  Upper: not enough samples ({n_upper}/{min_samples}) to train")
+        print(f"  Upper: not enough samples ({n_upper}) to train")
 
-    if n_lower >= min_samples:
-        lower_model.train(gradient_steps=2)
+    if factory.should_train(lower_model, n_lower):
+        factory.train_step(lower_model, gradient_steps=2)
         print(f"  Lower model trained (2 gradient steps)")
     else:
-        print(f"  Lower: not enough samples ({n_lower}/{min_samples}) to train")
+        print(f"  Lower: not enough samples ({n_lower}) to train")
 
     print("  ✓ Replay buffer + training OK\n")
 
 
 def main():
+    """直接运行集成测试（非 pytest 模式）。"""
     print("\n" + "=" * 60)
     print("  HRL Satellite Routing — Integration Test")
     print("=" * 60 + "\n")
 
+    from env.sim_engine import NetworkSimEngine
+    from agents.model_factory import ModelFactory
+    from env.upper_env_shell import UpperEnvShell
+    from env.lower_kpath_env_shell import LowerKPathEnvShell
+    from train.rollout import run_episode
+
     t_total = time.time()
 
-    sim = test_core_modules()
-    upper_model, lower_model = test_env_shells(sim)
-    upper_exps, lower_exps = test_rollout(sim, upper_model, lower_model)
-    test_replay_buffer(upper_model, lower_model, upper_exps, lower_exps)
+    # Build shared objects
+    sim_obj = NetworkSimEngine(
+        constellation_name="Kuiper", shell_idx=0, dT=120,
+        n_domains=2, link_capacity_mbps=2000.0, arrival_rate=3.0, seed=42,
+    )
+    fact = ModelFactory(algorithm="DQN")
+    dqn_cfg = {"learning_rate": 1e-4, "buffer_size": 10000, "batch_size": 32}
+    upper_env = UpperEnvShell(sim_obj)
+    lower_env = LowerKPathEnvShell(sim_obj, K=4)
+    u_model = fact.create_model(upper_env, dqn_cfg, seed=42)
+    l_model = fact.create_model(lower_env, dqn_cfg, seed=42)
+
+    test_core_modules(sim_obj)
+    test_env_shells(sim_obj, fact)
+
+    ep_res = run_episode(
+        u_model, l_model, sim_obj,
+        T_episode=5, lower_mode="k_path", K=4, deterministic=False,
+    )
+    test_rollout(sim_obj, u_model, l_model, ep_res)
+    test_replay_buffer(fact, u_model, l_model, ep_res)
 
     print("=" * 60)
     print(f"  ALL TESTS PASSED  ({time.time() - t_total:.1f}s total)")
