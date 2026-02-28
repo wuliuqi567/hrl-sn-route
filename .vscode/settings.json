@@ -1,0 +1,12 @@
+{
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda",
+    "python.analysis.extraPaths": [
+        "${workspaceFolder}/StarPerf_Simulator",
+        "${workspaceFolder}/StarPerf_Simulator/src"
+    ],
+    "python.autoComplete.extraPaths": [
+        "${workspaceFolder}/StarPerf_Simulator",
+        "${workspaceFolder}/StarPerf_Simulator/src"
+    ]
+}
