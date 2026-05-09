@@ -28,6 +28,15 @@ dependencies = [
     "ruptures==1.1.10",
 ]
 
+[tool.hatch.build.targets.wheel]
+only-include = [
+    "StarPerf.py",
+    "src",
+    "samples",
+    "kits",
+    "visualization",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

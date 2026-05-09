@@ -87,7 +87,7 @@ def main():
 
 
 if __name__ == '__main__':
-    #main()
+    main()
 
     import src.constellation_generation.by_manual.constellation_information as constellation_information
 
